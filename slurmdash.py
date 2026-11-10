@@ -76,18 +76,69 @@ FAIL_STATES = {"FAILED": "crash", "OUT_OF_MEMORY": "OOM"}     # the user's fault
 SHAME_DAYS = 7
 PODIUM = ("😈", "👹", "👺")
 GPU_EMOJI = {"l40s": "🐴", "h100": "🚀"}
+GPU_BASES = ("mi300a", "h200", "h100", "a100", "l40s", "a40", "v100", "p100", "t4", "l4")
+GPU_MEM = {"h100": 80, "h200": 141, "a100": 40}   # memory of the full GPU, for MIG slice fractions
 
 
 def E(s):
     return s if FUN else ""
 
 
+def canon_type(t):
+    """One name per GPU kind. Clusters accept several spellings: 'nvidia_h100_80gb_hbm3_1g.10gb',
+    'h100_1g.10gb', 'h100_1.10' and 'h100_10gb' all become 'h100_1g.10gb', and
+    'nvidia_h100_80gb_hbm3' or 'h100_80gb' become 'h100'."""
+    t = (t or "").lower()
+    base = next((b for b in GPU_BASES if b in t), None)
+    if base is None:
+        return t or None
+    m = re.search(r"(\d)g\.(\d+)gb", t) or re.search(rf"{base}_(\d)\.(\d+)$", t)
+    if m:
+        return f"{base}_{m.group(1)}g.{m.group(2)}gb"
+    m = re.search(rf"{base}_(\d+)gb$", t)
+    if m and int(m.group(1)) < GPU_MEM.get(base, 999):
+        mem = int(m.group(1))
+        g = {10: 1, 20: 2, 40: 3}.get(mem)
+        return f"{base}_{g}g.{mem}gb" if g else base
+    return base
+
+
+def is_mig(t):
+    return bool(t and re.search(r"\dg\.\d+gb", t))
+
+
+def gpu_frac(t):
+    """Share of a full GPU. The Alliance bills a MIG slice as max(compute/7, memory/full)."""
+    m = re.search(r"(\d)g\.(\d+)gb", t or "")
+    if not m:
+        return 1.0
+    return max(int(m.group(1)) / 7, int(m.group(2)) / GPU_MEM.get(t.split("_")[0], 80))
+
+
+def pretty_type(t):
+    if not t:
+        return "GPU"
+    m = re.search(r"\dg\.\d+gb", t)
+    return f"{t.split('_')[0].upper()} {m.group(0)} MIG" if m else t.upper()
+
+
+def short_type(t):
+    """Compact label for tight columns: 'H100/1g' for a MIG slice, 'L40S' for a full GPU."""
+    m = re.search(r"(\d)g\.\d+gb", t or "")
+    return f"{t.split('_')[0].upper()}/{m.group(1)}g" if m else (t or "gpu").upper()
+
+
+def gpu_emoji(t):
+    return "🍕" if is_mig(t) else GPU_EMOJI.get(t, "🎮")     # a slice of a GPU
+
+
 def kwh_rate(gpu_type):
-    return KWH_PER_GPU_H.get(gpu_type or "", 0.65)
+    return KWH_PER_GPU_H.get((gpu_type or "").split("_")[0], 0.65) * gpu_frac(gpu_type)
 
 
 def usd_rate(gpu_type):
-    return AWS_USD_PER_GPU_H.get(gpu_type or "", AWS_USD_PER_GPU_H["l40s"])
+    base = (gpu_type or "").split("_")[0]
+    return AWS_USD_PER_GPU_H.get(base, AWS_USD_PER_GPU_H["l40s"]) * gpu_frac(gpu_type)
 
 
 def fmt_usd(x):
@@ -172,7 +223,7 @@ def gpus_in(s):
         n = int(m.group("n"))
         if m.group("t"):
             typed += n
-            typ = typ or m.group("t").lower()
+            typ = typ or canon_type(m.group("t"))
         else:
             untyped.append(n)
     return (max(untyped) if untyped else typed), typ
@@ -189,7 +240,10 @@ def short_part(p, types):
     for q in p.split(","):
         low = q.lower()
         hits = [low.find(t) for t in types if t in low]
-        out.append(q[min(hits):] if hits and min(hits) > 0 else q)
+        if hits and min(hits) > 0:
+            out.append(q[min(hits):])
+        else:                                   # Alliance: 'gpubase_bygpu_b1' -> 'bygpu_b1'
+            out.append(re.sub(r"^(gpu|cpu)base_", "", q))
     return ",".join(out)
 
 
@@ -245,6 +299,7 @@ class Collector:
         self._usage_jobs, self._usage_since, self._usage_ts = {}, None, 0.0
         self._usage_ok, self._usage_err, self._usage_busy = False, None, False
         self._usage_lock = threading.Lock()
+        self._usage_users = set()
         self.sync_usage = False                  # --once / collect: poll sacct inline
         self._bgstate = {}
 
@@ -271,10 +326,12 @@ class Collector:
         if not accts:
             raise RuntimeError(f"no fairshare association for {self.user}; pass --account")
         env = os.environ.get("SLURM_ACCOUNT") or os.environ.get("SBATCH_ACCOUNT")
-        for a, _ in accts:
-            if a == env:
-                return a
-        return max(accts, key=lambda a: a[1])[0]
+        names = [a for a, _ in accts]
+        for cand in ([f"{env}_gpu", env] if env else []):
+            if cand in names:
+                return cand
+        gpu = [a for a in accts if a[0].endswith("_gpu")]     # Alliance: def-lab_cpu and def-lab_gpu
+        return max(gpu or accts, key=lambda a: a[1])[0]
 
     def lab_shares(self):
         out = self.slurm.run(["sshare", "-P", "-n", "-a", "-A", self.account, SSHARE_LAB])
@@ -386,8 +443,8 @@ class Collector:
                 continue
             jid, user, acct, part, st, prio, left, tres, nn, start, used, limit, reason, name = \
                 [x.strip() for x in f]
-            g, _ = gpus_in(tres)
-            jobs.append(dict(id=jid, user=user, acct=acct, part=part, st=st, prio=fnum(prio),
+            g, rtype = gpus_in(tres)
+            jobs.append(dict(id=jid, user=user, acct=acct, part=part, st=st, prio=fnum(prio), rtype=rtype,
                              left_h=parse_hours(left), gpus=g * max(1, int(fnum(nn, 1))),
                              start=start, used=used, limit=limit, reason=reason.strip("()"),
                              name=name))
@@ -427,12 +484,13 @@ class Collector:
         try:
             now = time.time()
             since = (self._usage_since or now - BOARD_DAYS * 86400) - 3600
-            out = self.slurm.run(["sacct", "-a", "-X", "-n", "-P", "-A", self.account,
-                                  "-S", datetime.fromtimestamp(since).strftime(ISO), "-E", "now",
-                                  "-o", "JobIDRaw,JobID,User,Submit,Start,End,AllocTRES,State"], timeout=600)
+            out = sacct_range(self.slurm, ["-a", "-X", "-n", "-P", "-A", self.account, "-o",
+                                           "JobIDRaw,JobID,User,Submit,Start,End,AllocTRES,State"], since)
             new = {}
             for line in out.splitlines():
                 f = [x.strip() for x in line.split("|")]
+                if len(f) >= 8:
+                    self._usage_users.add(f[2])  # any job, GPU or not: used to spot hidden labmates
                 if len(f) < 8 or parse_ts(f[4]) is None:
                     continue                     # never started
                 g, typ = gpus_in(f[6])
@@ -482,6 +540,7 @@ class Collector:
         for j in jobs:
             if j["user"] == self.user and j["id"] in alloc:
                 j["gpus"], j["exact"] = alloc[j["id"]][0], True
+                j["rtype"] = alloc[j["id"]][1] or j.get("rtype")
         sprio = {}
         if any(j["user"] == self.user and j["st"] == "PD" for j in jobs):
             try:
@@ -492,8 +551,7 @@ class Collector:
         snap["ts"] = time.time()
         snap["halflife_h"] = parse_hours(cfg.get("PriorityDecayHalfLife", ""))
         snap["boards"], snap["shame"], snap["boards_note"] = self.usage_boards()
-        seen = {u for b in (snap["boards"] or {}).values() for u, _ in b["rows"]}
-        if snap["boards"] is not None and seen <= {self.user} and \
+        if snap["boards"] is not None and self._usage_users <= {self.user} and \
                 any(r["eff"] > 0 for r in board if r["user"] != self.user):
             snap["boards_note"] = "sacct only shows your own jobs on this cluster"
         gpuh, err = self._bg("sreport", 1800, self.lab_gpuh)
@@ -541,7 +599,7 @@ def partition_types(nodes):
     votes = {}
     for n in nodes:
         for p in n["parts"]:
-            votes.setdefault(p, Counter())[n["type"]] += 1
+            votes.setdefault(p, Counter())[n["type"]] += n["total"] * gpu_frac(n["type"])
     return {p: c.most_common(1)[0][0] for p, c in votes.items()}
 
 
@@ -571,10 +629,11 @@ def estimate_wait(free, need, running, capacity):
 
 def build_snapshot(user, account, acct_row, board, clu_rows, weights, nodes, jobs, sprio):
     types = gpu_summary(nodes)
-    order = sorted(types, key=lambda t: -types[t]["total"])
+    order = sorted(types, key=lambda t: -types[t]["total"] * gpu_frac(t))   # full GPUs before MIG slices
     p2t = partition_types(nodes)
-    for j in jobs:
-        j["type"] = next((p2t[p] for p in j["part"].split(",") if p in p2t), None)
+    for j in jobs:                              # partitions can mix GPU kinds: trust the request first
+        j["type"] = j.get("rtype") if j.get("rtype") in types else \
+            next((p2t[p] for p in j["part"].split(",") if p in p2t), None)
         if j["type"] and not j["gpus"] and not j.get("exact"):
             j["gpus"] = 1                       # e.g. --gpus=N jobs whose %b shows N/A
 
@@ -714,6 +773,32 @@ class History:
 
 
 SACCT_FMT = "JobIDRaw,User,Start,End,AllocTRES,Priority"
+_SACCT_SPAN = [None]          # widest date range this cluster's sacct has accepted, in seconds
+
+
+def sacct_range(slurm, args, t_from, timeout=600):
+    """sacct from t_from to now, split into smaller windows when slurmdbd refuses a wide
+    one ("Too wide of a date range": its MaxQueryTimeRange). A job spanning two windows
+    comes back twice, so callers dedupe by JobIDRaw."""
+    now = time.time()
+    span = _SACCT_SPAN[0] or (now - t_from)
+    while True:
+        try:
+            parts, a = [], t_from
+            while a < now:
+                b = min(now, a + span)
+                if now - b < 3600:              # don't leave a sliver of a window at the end
+                    b = now
+                parts.append(slurm.run(["sacct", *args, "-S", datetime.fromtimestamp(a).strftime(ISO),
+                                        "-E", "now" if b >= now else datetime.fromtimestamp(b).strftime(ISO)],
+                                       timeout=timeout))
+                a = b
+            return "".join(parts)
+        except RuntimeError as e:
+            if "too wide" not in str(e).lower() or span <= 86400:
+                raise
+            span = max(86400.0, span / 2)
+            _SACCT_SPAN[0] = span
 
 
 BOARD_DAYS = 30
@@ -795,8 +880,11 @@ def build_labs(gpuh, clu, acct_now, ours, our_kwh, rate, our_usd=None, usd_per_g
     for acct, _, fs, _ in clu["users"]:
         fs_by.setdefault(acct, []).append(fs)
     fs_by.setdefault(ours, [])
+    gpu_only = ours.endswith("_gpu")           # Alliance clusters split each lab into _cpu and _gpu
     labs = []
     for a, fss in fs_by.items():
+        if gpu_only and not a.endswith("_gpu"):
+            continue
         h = gpuh.get(a, 0.0) if gpuh is not None else None
         labs.append(dict(acct=a, gpuh=h, now=acct_now.get(a, 0), xs=clu["accts"].get(a),
                          fair=statistics.median(fss) if fss else None,
@@ -833,20 +921,23 @@ def backfill(slurm, account, user, board, halflife_h, days=60, step_h=1.0):
     t_end = time.time()
     t_plot = t_end - days * 86400
     t0 = t_plot - (4 * hl if hl else 0) * 3600              # warm-up so the decayed sums settle
-    cmd = ["sacct", "-a", "-X", "-n", "-P", "-A", account,
-           "-S", datetime.fromtimestamp(t0).strftime(ISO), "-E", "now", "-o"]
+    cmd = ["-a", "-X", "-n", "-P", "-A", account, "-o"]
     try:
-        out, has_prio = slurm.run(cmd + [SACCT_FMT], timeout=900), True
-    except RuntimeError:                                    # older sacct without Priority
-        out, has_prio = slurm.run(cmd + [SACCT_FMT.rsplit(",", 1)[0]], timeout=900), False
+        out, has_prio = sacct_range(slurm, cmd + [SACCT_FMT], t0, timeout=900), True
+    except RuntimeError as e:                               # older sacct without Priority
+        if "too wide" in str(e).lower():
+            raise
+        out, has_prio = sacct_range(slurm, cmd + [SACCT_FMT.rsplit(",", 1)[0]], t0, timeout=900), False
+    rows = {}
+    for line in out.splitlines():                           # windows overlap: one row per job
+        f = [x.strip() for x in line.split("|")]
+        if len(f) >= 5:
+            rows[f[0]] = f
 
     step = step_h * 3600
     n = int((t_end - t0) / step) + 1
     contrib, prio_pts, njobs = {}, [], 0
-    for line in out.splitlines():
-        f = [x.strip() for x in line.split("|")]
-        if len(f) < 5:
-            continue
+    for f in rows.values():
         s0 = parse_ts(f[2])
         if s0 is None:
             continue                                        # never started
@@ -915,11 +1006,11 @@ def submit_hint(samples, snap):
             continue
         m, overall = statistics.median(cur), statistics.median(allw)
         if m >= max(4.0, 1.5 * overall):
-            return E("🚫 ") + f"Avoid now: {hour_range(hour)} {t.upper()} backlog (median ~{m:.0f}h)", "#c0392b"
+            return E("🚫 ") + f"Avoid now: {hour_range(hour)} {pretty_type(t)} backlog (median ~{m:.0f}h)", "#c0392b"
         meds = {h: statistics.median(v) for h, v in by_hour.items() if len(v) >= 5}
         if best is None and meds:
             bh = min(meds, key=meds.get)
-            best = (E("✅ ") + f"{t.upper()} now: median wait ~{fmt_hours(m)} at this hour, "
+            best = (E("✅ ") + f"{pretty_type(t)} now: median wait ~{fmt_hours(m)} at this hour, "
                     f"quietest {hour_range(bh)} (~{fmt_hours(meds[bh])})")
     return (best, "#2e6b34") if best else ("Not enough samples for this hour yet", "grey30")
 
@@ -1296,7 +1387,7 @@ def p_gpu(t, T, width=100):
     g = Table.grid(padding=(0, 2))
     g.add_column(style=MUTED, no_wrap=True)
     g.add_column(no_wrap=True)
-    g.add_row("GPUs", Text.assemble((f"{T['free']} free{'' if T['free'] else E(' 😭')}",
+    g.add_row("slices" if is_mig(t) else "GPUs", Text.assemble((f"{T['free']} free{'' if T['free'] else E(' 😭')}",
                                      f"bold {GREEN if T['free'] else RED}"),
                                     f"{gap}{T['used']} used{gap}", (f"{T['total']} total", "bold")))
     g.add_row("dead", Text(f"{T['dead']} on {T['dead_nodes']} nodes{E(' 💀') if T['dead'] else ''}",
@@ -1315,7 +1406,7 @@ def p_gpu(t, T, width=100):
                 if T["rate"] else f"   ≤{fmt_hours(T['wait_h'])} from time limits")
     mood = "👴" if (T["wait_h"] or 0) >= 24 else {GREEN: "🏃", YELLOW: "☕", RED: "🐌"}.get(wc, "")
     g.add_row("wait", Text.assemble((wt + E(" " + mood if mood else ""), f"bold {wc}"), (note, DIM)))
-    return Panel(g, title=title(E(GPU_EMOJI.get(t, "🎮") + " ") + t.upper(), GREEN), border_style=GREEN)
+    return Panel(g, title=title(E(gpu_emoji(t) + " ") + pretty_type(t), GREEN), border_style=GREEN)
 
 
 def p_achievements(snap):
@@ -1428,7 +1519,7 @@ def p_mygpus(snap, util, rows=8):
                       style=GREEN if avg >= 50 else (YELLOW if avg >= 10 else RED))
         name = g["name"] + (f" ×{g['n']}" if g["n"] > 1 else "")
         body.add_row(Text(g["label"], style="bold"), name,
-                     Text(f"{g['gpus']}×{(g['type'] or 'gpu').upper()}", style=GREEN),
+                     Text(f"{g['gpus']}×{short_type(g['type'])}", style=GREEN),
                      Text(g["where"], style=MUTED), f"{g['used']} / {g['limit']}", ut)
     if more_row:
         body.add_row(Text(f"… +{sum(g['n'] for g in hidden)} more jobs", style=DIM),
@@ -1450,7 +1541,7 @@ def p_qvy(snap, width):
     for lab, n, c in zip((">2x yours", "1.5–2x", "1–1.5x", "below you"), T["hist"], (RED, RED, RED, GREEN)):
         g.add_row(lab, Text("█" * (max(1, round(bw * n / mx)) if n else 0), style=c), f"{n:,}")
     sub = Text(f"your prio {fmt_int(T['my_prio'])}{' (new-job estimate)' if T['est'] else ''}", style=DIM)
-    return Panel(g, title=title(E("🐌 ") + f"QUEUE vs YOU ({t.upper()})", MUTED), subtitle=sub,
+    return Panel(g, title=title(E("🐌 ") + f"QUEUE vs YOU ({pretty_type(t)})", MUTED), subtitle=sub,
                  border_style=FRAME)
 
 
@@ -1563,8 +1654,9 @@ def build_layout(console, state):
     def gpu_h(t):
         return 7 + bool(snap["types"][t]["resv"])
 
-    gpu_side = len(types) > 1 and right_w // len(types) >= 40      # L40S | H100 side by side
-    types_h = (max(map(gpu_h, types)) if gpu_side else sum(map(gpu_h, types))) if types else 0
+    per_row = max(1, min(len(types), right_w // 40)) if types else 1      # e.g. L40S | H100 side by side
+    type_rows = [types[i:i + per_row] for i in range(0, len(types), per_row)]
+    types_h = sum(max(map(gpu_h, r)) for r in type_rows)
     left_need = 9 + 5 + 13                     # fairshare, priority, top-ten boards
     stack = right_w < 110                      # too narrow for achievements and wall side by side
     shame_h = SHAME_H + 6 if stack else SHAME_H
@@ -1592,12 +1684,11 @@ def build_layout(console, state):
                       Layout(name="boards"))
     bw = left_w // len(BOARDS) - 4
     left["boards"].split_row(*[Layout(p_compute(snap, key, label, bw)) for key, label, _ in BOARDS])
-    if gpu_side:
-        gpu_row = Layout(size=types_h)
-        gpu_row.split_row(*[Layout(p_gpu(t, snap["types"][t], right_w // len(types) - 4)) for t in types])
-        kids = [gpu_row]
-    else:
-        kids = [Layout(p_gpu(t, snap["types"][t], right_w - 4), size=gpu_h(t)) for t in types]
+    kids = []
+    for r in type_rows:
+        row = Layout(size=max(map(gpu_h, r)))
+        row.split_row(*[Layout(p_gpu(t, snap["types"][t], right_w // len(r) - 4)) for t in r])
+        kids.append(row)
     shame = Layout(size=shame_h)
     if stack:
         shame.split_column(Layout(p_achievements(snap), size=6), Layout(p_wall(snap, SHAME_H)))
