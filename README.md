@@ -12,7 +12,7 @@ pip install --no-index rich
 ```
 Then, create an alias:
 ```bash
-echo "alias slurmdash='~/envs/slurmdash/bin/python ~/projects/aip-evanesce/slurmdash/slurmdash.py'" >> ~/.bashrc
+echo "alias slurmdash='~/envs/slurmdash/bin/python ~/<path to folder>/slurmdash/slurmdash.py'" >> ~/.bashrc
 source ~/.bashrc
 ```
 Finally, run it with one simple command:
