@@ -1,3 +1,4 @@
+![Slurmdash Screenshot](slurmdash.png)
 # Slurmdash
 Slurmdash was born a long long time ago, on October 20th 2026, when Alex (one of the pionneering hammer lab members, who's probably very rich and successful running a baguette factory by the time you read this) and Arjun had a chat about the lab's compute usage at the Engineering Cafe. You see, at the time, Killarney wasn't the most usable cluster (I'm sure this is all solved now), and the lab had trouble keeping an eye on how much compute it was using. Some hammerheads were using a lot, some very little, and sometime jobs were scheduling in seconds, other times they took days! The lab needed a tool to monitor the state of the cluster. 
 
